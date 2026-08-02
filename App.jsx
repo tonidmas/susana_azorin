@@ -1,12 +1,13 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from "recharts";
 import * as XLSX from "xlsx";
+import { createClient } from "@supabase/supabase-js";
 import {
   Home, Users, Wallet, AlertTriangle, KeyRound, Plus, X, Pencil, Trash2,
   Upload, Download, ShieldCheck, ShieldAlert, DoorOpen, DoorClosed,
-  ChevronLeft, ChevronRight, Loader2, Check
+  ChevronLeft, ChevronRight, Loader2, Check, RefreshCw, WifiOff
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -15,7 +16,6 @@ import {
 
 const MESES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
 const MESES_CORTOS = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
-const STORAGE_KEY = "rental-app-data-v1";
 const GASTOS_FIJOS_KEYS = ["luz", "agua", "limpieza", "internet", "ibi", "reparaciones"];
 const GASTOS_FIJOS_LABELS = { luz: "Luz", agua: "Agua", limpieza: "Limpieza", internet: "Internet", ibi: "IBI", reparaciones: "Reparaciones" };
 const TOTAL_HABITACIONES = 12;
@@ -88,21 +88,12 @@ function overlapsMonth(t, ym) {
 function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 function daysInMonth(y, m) { return new Date(y, m, 0).getDate(); } // m: 1-12
 
-/* Almacenamiento local del navegador (persiste entre visitas en este dispositivo/navegador) */
-const storage = {
-  async get(key) {
-    try {
-      const v = window.localStorage.getItem(key);
-      return v !== null ? { key, value: v } : null;
-    } catch (e) {
-      return null;
-    }
-  },
-  async set(key, value) {
-    window.localStorage.setItem(key, value);
-    return { key, value };
-  }
-};
+/* Conexión a Supabase (base de datos en la nube, compartida entre dispositivos) */
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const SUPABASE_CONFIGURED = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+const supabase = SUPABASE_CONFIGURED ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+const ROW_ID = "main"; // fila única donde vive todo el estado de la app
 
 function emptyTenant() {
   return {
@@ -367,6 +358,7 @@ export default function App() {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [irpfReduccion, setIrpfReduccion] = useState(0.5);
+  const [connError, setConnError] = useState(false);
   const fileInputRef = useRef(null);
   const saveTimer = useRef(null);
   const toastTimer = useRef(null);
@@ -379,40 +371,71 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), 3800);
   }
 
-  /* Carga inicial */
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await storage.get(STORAGE_KEY);
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          setTenants(Array.isArray(parsed.tenants) ? parsed.tenants : []);
-          setExpenses(parsed.expenses && typeof parsed.expenses === "object" ? parsed.expenses : {});
-          if (typeof parsed.irpfReduccion === "number") setIrpfReduccion(parsed.irpfReduccion);
-        }
-      } catch (e) {
-        /* sin datos previos todavía */
-      } finally {
-        setLoaded(true);
+  /* Carga inicial y recarga al volver a la pestaña (útil entre dispositivos) */
+  const skipNextSaveRef = useRef(false);
+
+  const loadFromServer = useCallback(async ({ silent } = {}) => {
+    if (!SUPABASE_CONFIGURED) { setLoaded(true); return; }
+    try {
+      const { data, error } = await supabase
+        .from("rental_app_state")
+        .select("*")
+        .eq("id", ROW_ID)
+        .maybeSingle();
+      if (error) throw error;
+      if (data) {
+        skipNextSaveRef.current = true;
+        setTenants(Array.isArray(data.tenants) ? data.tenants : []);
+        setExpenses(data.expenses && typeof data.expenses === "object" ? data.expenses : {});
+        if (typeof data.irpf_reduccion === "number") setIrpfReduccion(data.irpf_reduccion);
+      } else {
+        await supabase.from("rental_app_state").upsert({ id: ROW_ID, tenants: [], expenses: {}, irpf_reduccion: 0.5 });
       }
-    })();
+      setConnError(false);
+    } catch (e) {
+      console.error("Error al cargar de Supabase", e);
+      setConnError(true);
+      if (!silent) notify("No se pudo conectar con la base de datos. Revisa tu conexión.");
+    } finally {
+      setLoaded(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => { loadFromServer(); }, [loadFromServer]);
+
+  useEffect(() => {
+    function refresh() { loadFromServer({ silent: true }); }
+    function onVisibility() { if (document.visibilityState === "visible") refresh(); }
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [loadFromServer]);
 
   /* Guardado con debounce */
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || !SUPABASE_CONFIGURED) return;
+    if (skipNextSaveRef.current) { skipNextSaveRef.current = false; return; }
     setSaving(true);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        await storage.set(STORAGE_KEY, JSON.stringify({ tenants, expenses, irpfReduccion }));
+        const { error } = await supabase.from("rental_app_state").upsert({
+          id: ROW_ID, tenants, expenses, irpf_reduccion: irpfReduccion, updated_at: new Date().toISOString()
+        });
+        if (error) throw error;
+        setConnError(false);
       } catch (e) {
-        console.error("Error al guardar", e);
-        notify("No se pudieron guardar los datos.");
+        console.error("Error al guardar en Supabase", e);
+        setConnError(true);
+        notify("No se pudieron guardar los cambios. Comprueba tu conexión.");
       } finally {
         setSaving(false);
       }
-    }, 500);
+    }, 700);
     return () => clearTimeout(saveTimer.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenants, expenses, irpfReduccion, loaded]);
@@ -667,6 +690,22 @@ export default function App() {
     );
   }
 
+  if (!SUPABASE_CONFIGURED) {
+    return (
+      <div className="rg-root" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", padding: 24 }}>
+        <GlobalStyles />
+        <div className="rg-card" style={{ maxWidth: 480, padding: 26, textAlign: "center" }}>
+          <WifiOff size={26} style={{ color: "var(--warn)", marginBottom: 12 }} />
+          <div className="rg-modal-title" style={{ marginBottom: 8 }}>Falta configurar la base de datos</div>
+          <p style={{ color: "var(--text-dim)", fontSize: 13.5, lineHeight: 1.6 }}>
+            Esta app necesita las variables <code className="rg-mono">VITE_SUPABASE_URL</code> y <code className="rg-mono">VITE_SUPABASE_ANON_KEY</code>
+            configuradas en Vercel (Project Settings → Environment Variables) para poder guardar los datos. Sigue la guía <strong>GUIA_SUPABASE.md</strong> incluida en el proyecto.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   const monthLabel = `${MESES[selMonthNum - 1]} ${selYear}`;
 
   return (
@@ -698,11 +737,16 @@ export default function App() {
           </button>
 
           <div className="rg-sidebar-footer">
-            {saving ? (
+            {connError ? (
+              <span className="rg-save-indicator" style={{ color: "var(--danger)" }}><WifiOff size={12} /> Sin conexión con la base de datos</span>
+            ) : saving ? (
               <span className="rg-save-indicator"><Loader2 size={12} /> Guardando…</span>
             ) : (
-              <span className="rg-save-indicator"><Check size={12} color="var(--ok)" /> Datos guardados</span>
+              <span className="rg-save-indicator"><Check size={12} color="var(--ok)" /> Datos guardados en la nube</span>
             )}
+            <button className="rg-icon-btn" style={{ marginTop: 4 }} onClick={() => loadFromServer()} title="Refrescar datos">
+              <RefreshCw size={12} /> <span style={{ fontSize: 11 }}>Refrescar</span>
+            </button>
           </div>
         </div>
 
