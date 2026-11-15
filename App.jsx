@@ -1227,8 +1227,16 @@ export default function App() {
   function incomeForMonth(ym) {
     return tenants.reduce((sum, t) => sum + (t.pagos && t.pagos[ym] ? rentaEnMes(t, ym) : 0), 0);
   }
+  /* Habitaciones ocupadas en un mes, contadas POR HABITACIÓN y en proporción a los días
+     (igual que el calendario de Habitaciones). Antes se contaban inquilinos que tocaban el mes,
+     así que los que se habían ido o las fichas duplicadas inflaban la ocupación hasta el 100%. */
   function occupancyForMonth(ym) {
-    return tenants.filter(t => overlapsMonth(t, ym)).length;
+    const [y, m] = ym.split("-").map(Number);
+    const total = ROOM_LABELS.reduce((s, label) => {
+      const { percent } = roomMonthOccupancy(tenants, label, y, m);
+      return s + (percent || 0) / 100;
+    }, 0);
+    return Math.round(total * 10) / 10;
   }
   function occupancyPctForMonth(ym) {
     return (occupancyForMonth(ym) / TOTAL_HABITACIONES) * 100;
@@ -1403,7 +1411,7 @@ export default function App() {
     tenants.forEach(t => {
       const importe = Number(t.fianzaImporte) || 0;
       if (importe <= 0) return;
-      if (!t.fechaPagoFianza) pendienteCobro += importe;
+      if (!t.fechaPagoFianza) { if (t.activo) pendienteCobro += importe; } // igual que la alerta: solo inquilinos activos
       else if (!t.fechaDevolucionFianza) enPoder += importe;
       else devuelto += importe;
     });
@@ -1827,7 +1835,7 @@ export default function App() {
               incomeForMonth={incomeForMonth} fixedExpensesForMonth={fixedExpensesForMonth}
               managementFeeForMonth={managementFeeForMonth} totalExpensesForMonth={totalExpensesForMonth}
               netProfitForMonth={netProfitForMonth} profitabilityForMonth={profitabilityForMonth}
-              yearData={yearData} fianzas={fianzas} occupancyStats={occupancyStats}
+              yearData={yearData} fianzas={fianzas} occupancyStats={occupancyStats} ocupadasHoy={ROOM_LABELS.filter(label => tenants.some(t => t.activo && matchesRoom(t.habitacion, label))).length}
               selYear={selYear} incomeEmpadronadosForYear={incomeEmpadronadosForYear}
               irpfReduccion={irpfReduccion} setIrpfReduccion={setIrpfReduccion}
             />
@@ -2041,7 +2049,7 @@ function DateField({ label, value, onChange }) {
 /* Dashboard                                                            */
 /* ------------------------------------------------------------------ */
 
-function DashboardView({ monthLabel, selectedMonth, shiftMonth, incomeForMonth, fixedExpensesForMonth, managementFeeForMonth, totalExpensesForMonth, netProfitForMonth, profitabilityForMonth, yearData, fianzas, occupancyStats, selYear, incomeEmpadronadosForYear, irpfReduccion, setIrpfReduccion }) {
+function DashboardView({ monthLabel, selectedMonth, shiftMonth, incomeForMonth, fixedExpensesForMonth, managementFeeForMonth, totalExpensesForMonth, netProfitForMonth, profitabilityForMonth, yearData, fianzas, occupancyStats, ocupadasHoy, selYear, incomeEmpadronadosForYear, irpfReduccion, setIrpfReduccion }) {
   const ingresos = incomeForMonth(selectedMonth);
   const gastosFijosMes = fixedExpensesForMonth(selectedMonth);
   const gestionMes = managementFeeForMonth(selectedMonth);
@@ -2112,6 +2120,9 @@ function DashboardView({ monthLabel, selectedMonth, shiftMonth, incomeForMonth, 
         <div className="rg-card rg-stat">
           <div className="rg-stat-label">Ocupación este mes ({TOTAL_HABITACIONES} hab.)</div>
           <div className="rg-stat-value" style={{ color: "var(--accent)" }}>{ocupacionMesPct.toFixed(1)}%</div>
+          <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 4 }}>
+            Según los días ocupados del mes · hoy: {ocupadasHoy} de {TOTAL_HABITACIONES} ocupadas
+          </div>
         </div>
         <div className="rg-card rg-stat">
           <div className="rg-stat-label">Ocupación media anual {selYear}</div>
@@ -2120,7 +2131,7 @@ function DashboardView({ monthLabel, selectedMonth, shiftMonth, incomeForMonth, 
         <div className="rg-card rg-stat">
           <div className="rg-stat-label">Ocupación total del año</div>
           <div className="rg-stat-value" style={{ color: "var(--accent)" }}>{occupancyStats.totalAnual.toFixed(1)}%</div>
-          <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 4 }}>{occupancyStats.roomMonths} de {occupancyStats.capacityRoomMonths} habitación-mes</div>
+          <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 4 }}>{Math.round(occupancyStats.roomMonths * 10) / 10} de {occupancyStats.capacityRoomMonths} habitación-mes</div>
         </div>
       </div>
 
